@@ -1,0 +1,152 @@
+---
+title: 'Processing of RNA-Seq samples. (DR-071)'
+date: '`r Sys.Date()`'
+author: 'Job van Riet'
+---
+
+
+```{r knitr_init, echo = FALSE, cache = FALSE, results = 'hide', warning=FALSE, message=FALSE}
+library(knitr)
+library(dplyr)
+library(rmdformats)
+
+## Global options
+options(max.print = '75')
+opts_chunk$set(echo = FALSE, cache = FALSE, prompt = FALSE, tidy = FALSE, comment = NA, message = FALSE, warning = FALSE)
+opts_knit$set(width = 90)
+```
+
+Used commands in this project.
+
+# CPCT-02 RNA
+
+## Perform adapter trimming (fastp)
+
+Run adapter trimming, low-quality, low-complexity trimming but without min. length selection.
+```
+files <- data.frame(R1 = list.files('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/fastq/', pattern = 'R1.*fastq.gz', recursive = T, full.names = T), stringsAsFactors = F) %>% dplyr::mutate(R2 = gsub('_R1_', '_R2_', R1), outR1 = file.path('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/trimmedReads/', gsub('.fastq.gz', '_fastpTrimmed.fastq.gz', basename(R1))), outR2 = file.path('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/trimmedReads/', gsub('.fastq.gz', '_fastpTrimmed.fastq.gz', basename(R2))), sample = gsub('_.*', '', basename(outR1)))
+
+sprintf('/mnt/share1/repository/software/fastp-0.23.2 --detect_adapter_for_pe -L -w 5 --in1 %s --in2 %s --out1 %s  --out2 %s', files$R1, files$R2, files$outR1, files$outR2) %>% write.table(., file = '~/test/runTrimming.txt', quote = F, row.names = F, col.names = F)
+```
+
+## Alignment
+
+Make genome index (STAR 2.7.9a; hg19_HMF; GENCODE v38)
+```
+/mnt/share1/repository/software/STAR-2.7.9 --runThreadN 25 --runMode genomeGenerate --genomeDir /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/indexSTAR_Gencode38 --genomeFastaFiles /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Homo_sapiens.GRCh37.GATK.illumina.fasta --sjdbGTFfile /mnt/share1/repository/software/ensembl-vep/Plugins/GRCh37/noChrPrefix_gencode.v38lift37.annotation.gtf
+```
+
+Perform STAR alignment per concatenated sample.
+```
+# DR71 reads (trimmed with fastp)
+fastqFiles <- data.frame(R1 = list.files('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/trimmedReads/', pattern = '_R1_.*fastq.gz', full.names = T), stringsAsFactors = F) %>% dplyr::mutate(R2 = gsub('_R1_','_R2_', R1), sample = gsub('_.*','',basename(R1)), readGroupID = gsub('_R1_.*fastpTrimmed.fastq.gz','',basename(R1)), outFile = sprintf('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/%s_', sample))
+
+# Make one command per sample and add all the lanes with correct RG in command.
+z <- fastqFiles %>% dplyr::group_by(sample) %>% dplyr::summarise(
+    x = sprintf('/mnt/share1/repository/software/STAR-2.7.9 --genomeDir /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/indexSTAR_Gencode38 --readFilesIn %s %s --readFilesCommand zcat --outFileNamePrefix %s --outSAMtype BAM Unsorted --outSAMunmapped Within --outSAMattributes NH HI AS nM NM MD jM jI MC ch XS --outSAMstrandField intronMotif --outFilterMultimapNmax 10 --outFilterMismatchNmax 3 --limitOutSJcollapsed 3000000 --chimSegmentMin 10 --chimOutType WithinBAM SoftClip --chimJunctionOverhangMin 10 --chimSegmentReadGapMax 3 --chimScoreMin 1 --chimScoreDropMax 30 --chimScoreJunctionNonGTAG 0 --chimScoreSeparation 1 --outFilterScoreMinOverLread 0.33 --outFilterMatchNminOverLread 0.33 --outFilterMatchNmin 35 --alignSplicedMateMapLminOverLmate 0.33 --alignSplicedMateMapLmin 35 --alignSJstitchMismatchNmax 5 -1 5 5 --twopassMode Basic --twopass1readsN -1 --runThreadN 15 --quantMode TranscriptomeSAM --outSAMattrRGline %s --outTmpDir /dev/shm/%s', paste(R1, collapse = ','), paste(R2, collapse = ','), unique(outFile), paste0(sprintf('ID:%s', readGroupID), collapse = ' , '), unique(sample))
+)
+
+# Perform in parallel.
+write.table(z$x, file = '~/test/runAlignment_dr71.txt', quote = F, row.names = F, col.names = F)
+```
+
+# Sort, mark duplicates, re-index and flagstats.
+## Sort BAM files.
+```
+for BAM in /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/*_Aligned.out.bam
+do echo "/mnt/share1/repository/software/sambamba-0.8.1 sort --tmpdir /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/TMP/ -t 5 -m 2GB ${BAM}";
+done
+```
+
+## Mark duplicates.
+```
+for BAM in /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/*sorted*bam
+do echo "/mnt/share1/repository/software/sambamba-0.8.1 markdup --tmpdir /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/TMP/ --sort-buffer-size 20480 -t 10 ${BAM} ${BAM%.bam}.markDup.bam";
+done
+```
+
+```
+# Redo files which failed due too many open files..
+files <- data.frame(noDup = list.files('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/', pattern = 'sorted.bam$', recursive = F, full.names = T), stringsAsFactors = F) %>% dplyr::mutate(withDup = gsub('.sorted.bam', '.sorted.markDup.bam', noDup), hasFile = file.exists(withDup))
+
+files = files %>% dplyr::filter(!hasFile)
+
+files <- files %>% dplyr::mutate(cmd = sprintf("/mnt/share1/repository/software/sambamba-0.8.1 markdup --tmpdir /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/TMP/ --sort-buffer-size 20480 --hash-table-size 1310720 --overflow-list-size 1500000 -t 10 %s %s", noDup, withDup))
+
+write.table(files$cmd, file = '~/test/runMark.txt', append = F, quote = F, row.names = F, col.names = F)
+```
+
+## Perform flagstats.
+```
+for BAM in /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/*markDup.bam
+do echo "/mnt/share1/repository/software/sambamba-0.8.1 flagstat -t 10 ${BAM} > ${BAM}.flagstat";
+done
+```
+
+# Count reads
+
+Only count primary alignment, paired-end and strand-specific; v2.0.3).
+```
+## Determine which sequencing kit was used as they have different strandmodes.
+logInfo <- base::do.call(base::rbind, pbapply::pblapply(list.files('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/', pattern = '*Log.final.out', full.names = T, recursive = T), function(x){
+    data <- readr::read_delim(x, delim = '|', trim_ws = T, col_names = c('info', 'value'), show_col_types = F)
+    data$sample <- base::gsub('_Log.*', '', base::basename(x))
+    return(data)
+}, cl = 10))
+
+logInfo <- logInfo %>%
+    dplyr::group_by(sample) %>%
+    dplyr::summarise(
+        avgInput = as.numeric(value[.$info == 'Average input read length']),
+        SequencingRNA = ifelse(avgInput > 200, 'Illumina NovaSeq', 'Illumina NextSeq')
+    ) %>%
+    dplyr::ungroup() %>% 
+    dplyr::filter(!is.na(avgInput)) %>% 
+    dplyr::mutate(
+        cmd = sprintf("/mnt/share1/repository/software/subread-2.0.3/bin/featureCounts -T 5 -t exon -g gene_id --primary -p -s %s -a /mnt/share1/repository/software/ensembl-vep/Plugins/GRCh37/noChrPrefix_gencode.v38lift37.annotation.gtf -o /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/counts/%s.counts /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/%s_Aligned.out.sorted.markDup.bam", ifelse(SequencingRNA == 'Illumina NovaSeq', 1, 2), sample, sample)
+)
+
+# Perform command in bash.
+write.table(unique(logInfo$cmd), '~/test/count.txt', quote = F, sep = '\t', row.names = F, col.names = F)
+```
+
+# Run Salmon for FPKM/TPM values.
+
+Prepare salmon index:
+```
+# Generate transcriptome fasta.
+gffread -w /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/transcripts.fa -g /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Homo_sapiens.GRCh37.GATK.illumina.fasta /mnt/share1/repository/software/ensembl-vep/Plugins/GRCh37/noChrPrefix_gencode.v38lift37.annotation.gtf
+
+# Remove duplicates.
+awk '/^>/{f=!d[$1];d[$1]=1}f' /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/transcripts.fa > /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/transcripts_noDups.fa
+
+# Generate decoy file.
+grep "^>" /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Homo_sapiens.GRCh37.GATK.illumina.fasta | cut -d " " -f 1 > /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/decoys.txt
+sed -i.bak -e 's/>//g' /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/decoys.txt
+
+# Combine transcript+genome fasta.
+cat /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/transcripts_noDups.fa /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Homo_sapiens.GRCh37.GATK.illumina.fasta > /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/gentrome.fa
+
+# Generate index.
+/mnt/share1/repository/software/salmon-1.8.0/bin/salmon index -t /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/gentrome.fa -d /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/decoys.txt -p 30 -i /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/ --gencode
+```
+
+Run Salmon:
+```
+# DR71 reads (trimmed with fastp)
+fastqFiles <- data.frame(R1 = list.files('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/trimmedReads/', pattern = '_R1_.*fastq.gz', full.names = T), stringsAsFactors = F) %>% dplyr::mutate(R2 = gsub('_R1_','_R2_', R1), sample = gsub('_.*','',basename(R1)), readGroupID = gsub('_R1_.*fastpTrimmed.fastq.gz','',basename(R1)), outFile = sprintf('/mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/Salmon/%s', sample))
+
+# Make one command per sample and add all the lanes with correct RG in command.
+z <- fastqFiles %>% dplyr::group_by(sample) %>% dplyr::summarise(
+    x = sprintf('/mnt/share1/repository/software/salmon-1.8.0/bin/salmon quant -i /mnt/share1/repository/general/genomes/hsapiens/hg19_HMF/Salmon/ -l A -p 10 --validateMappings --seqBias -1 %s -2 %s -o %s', paste(R1, collapse = ' '), paste(R2, collapse = ' '), unique(outFile)))
+
+# Perform in parallel.
+write.table(z$x, file = '~/test/runSalmon.txt', quote = F, row.names = F, col.names = F)
+```
+
+Generate coverage of AR region (bigwig):
+```
+for BAM in /mnt/share1/repository/HMF/DR71/Dec2021/dataHMF/RNASeq/BAM/*markDup.bam
+do echo "bamCoverage -b ${BAM} -o ${BAM/.bam/.coverageAR.bw} --region chrX:66100000:67000000 -p 1 -of bigwig  --ignoreDuplicates";
+done
+```
